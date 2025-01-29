@@ -1,86 +1,78 @@
-package computerdatabase
+import scala.concurrent.duration._
+
+import scala.util.Random
 
 import io.gatling.core.Predef._
 import io.gatling.http.Predef._
 
-import java.util.concurrent.ThreadLocalRandom
 
-/**
- * This sample is based on our official tutorials:
- *
- *   - [[https://docs.gatling.io/tutorials/recorder/ Gatling quickstart tutorial]]
- *   - [[https://docs.gatling.io/tutorials/advanced/ Gatling advanced tutorial]]
- */
-class ComputerDatabaseSimulation extends Simulation {
+class RinhaBackendSimulation
+  extends Simulation {
 
-  val feeder = csv("search.csv").random
+  val httpProtocol = http
+    .baseUrl("http://localhost:9999")
+    .userAgentHeader("Agente do Caos - 2023")
 
-  val search = exec(
-      http("Home").get("/"),
-      pause(1),
-      feed(feeder),
-      http("Search")
-        .get("/computers?f=#{searchCriterion}")
-        .check(
-          css("a:contains('#{searchComputerName}')", "href").saveAs("computerUrl")
-      ),
-      pause(1),
-      http("Select")
-        .get("#{computerUrl}")
-        .check(status.is(200)),
-      pause(1)
-  )
 
-  // repeat is a loop resolved at RUNTIME
-  val browse =
-    // Note how we force the counter name, so we can reuse it
-    repeat(4, "i")(
-      http("Page #{i}").get("/computers?p=#{i}"),
-      pause(1)
+
+  val criacaoEConsultaPessoas = scenario("Criação E Talvez Consulta de Pessoas")
+    .feed(tsv("pessoas-payloads.tsv").circular())
+    .exec(
+      http("criação")
+        .post("/pessoas").body(StringBody("#{payload}"))
+        .header("content-type", "application/json")
+        // 201 pros casos de sucesso :)
+        // 422 pra requests inválidos :|
+        // 400 pra requests bosta tipo data errada, tipos errados, etc. :(
+        .check(status.in(201, 422, 400))
+        // Se a criacao foi na api1 e esse location request atingir api2, a api2 tem que encontrar o registro.
+        // Pode ser que o request atinga a mesma instancia, mas estatisticamente, pelo menos um request vai atingir a outra.
+        // Isso garante o teste de consistencia de dados
+        .check(status.saveAs("httpStatus"))
+        .checkIf(session => session("httpStatus").as[String] == "201") {
+          header("Location").saveAs("location")
+        }
     )
-
-  // Note we should be using a feeder here
-  // let's demonstrate how we can retry: let's make the request fail randomly and retry a given
-  // number of times
-
-  val edit =
-    // let's try at max 2 times
-    tryMax(2)(
-      http("Form")
-        .get("/computers/new"),
-      pause(1),
-      http("Post")
-          .post("/computers")
-          .formParam("name", "Beautiful Computer")
-          .formParam("introduced", "2012-05-30")
-          .formParam("discontinued", "")
-          .formParam("company", "37")
-          .check(
-            status.is { session =>
-                // we do a check on a condition that's been customized with
-                // a lambda. It will be evaluated every time a user executes
-                // the request
-                200 + ThreadLocalRandom.current().nextInt(2)
-              }
-            )
-    )
-    // if the chain didn't finally succeed, have the user exit the whole scenario
-    .exitHereIfFailed
-
-  val httpProtocol =
-    http.baseUrl("https://computer-database.gatling.io")
-      .acceptHeader("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-      .acceptLanguageHeader("en-US,en;q=0.5")
-      .acceptEncodingHeader("gzip, deflate")
-      .userAgentHeader(
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/119.0"
+    .pause(1.milliseconds, 30.milliseconds)
+    .doIf(session => session.contains("location")) {
+      exec(
+        http("consulta")
+          .get("#{location}")
       )
+    }
 
-  val users = scenario("Users").exec(search, browse)
-  val admins = scenario("Admins").exec(search, browse, edit)
+  val buscaPessoas = scenario("Busca Válida de Pessoas")
+    .feed(tsv("termos-busca.tsv").circular())
+    .exec(
+      http("busca válida")
+        .get("/pessoas?t=#{t}")
+      // qq resposta na faixa 2XX tá safe
+    )
+
+  val buscaInvalidaPessoas = scenario("Busca Inválida de Pessoas")
+    .exec(
+      http("busca inválida")
+        .get("/pessoas")
+        // 400 - bad request se não passar 't' como query string
+        .check(status.is(400))
+    )
 
   setUp(
-    users.inject(rampUsers(10).during(10)),
-    admins.inject(rampUsers(2).during(10))
+    criacaoEConsultaPessoas.inject(
+      constantUsersPerSec(2).during(10.seconds), // warm up
+      constantUsersPerSec(5).during(15.seconds).randomized, // are you ready?
+
+      rampUsersPerSec(6).to(600).during(3.minutes) // lezzz go!!!
+    ),
+    buscaPessoas.inject(
+      constantUsersPerSec(2).during(25.seconds), // warm up
+
+      rampUsersPerSec(6).to(100).during(3.minutes) // lezzz go!!!
+    ),
+    buscaInvalidaPessoas.inject(
+      constantUsersPerSec(2).during(25.seconds), // warm up
+
+      rampUsersPerSec(6).to(40).during(3.minutes) // lezzz go!!!
+    )
   ).protocols(httpProtocol)
 }
